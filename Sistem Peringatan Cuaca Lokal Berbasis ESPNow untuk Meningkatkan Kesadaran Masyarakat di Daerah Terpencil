@@ -1,0 +1,251 @@
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+
+//------Library Sensor------
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <Adafruit_BMP280.h>
+
+//------Library GPS------
+#include <SoftwareSerial.h>
+#include <Gpsneo.h>
+
+//------Library OLED------
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+//------Inisialisasi PIN------
+#define DHTPIN       D4
+#define DHTTYPE      DHT22
+#define RAINDROP_PIN D3 
+#define BUZZER_PIN   D5   
+#define BATTERY_PIN  A0
+#define GPS_RX       D7
+#define GPS_TX       D6
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_BMP280 bmp; // I2C
+SoftwareSerial gpsSerial(GPS_RX, GPS_TX); // RX, TX
+TinyGPSPlus gps;
+
+//------Inisialisasi OLED------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+//------Struktur Data------
+typedef struct struct_message {
+  float dhtTemperature;   
+  float dhtHumidity;      
+  float bmpTemperature;   
+  float pressure;         
+  float altitudeBmp;      
+  float gpsLatitude;      
+  float gpsLongitude;     
+  float gpsAltitude;      
+  uint8_t gpsSat;         
+  float batteryVoltage;   
+  int rainDigital;        
+} struct_message;
+
+struct_message dataToSend;
+
+//------Alamat MAC Penerima------
+uint8_t broadcastAddress[] = {0x24, 0x6F, 0x28, 0x12, 0x34, 0x56};
+
+//------CALLBACK------
+void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) {
+  Serial.print("Status Pengiriman ESP-NOW: ");
+  if (sendStatus == 0) {
+    Serial.println("Berhasil");
+  } else {
+    Serial.println("Gagal");
+  }
+}
+
+//------Inisialisasi------
+void setup() {
+  Serial.begin(115200);
+
+  // Inisialisasi sensor DHT
+  dht.begin();
+
+  // Inisialisasi sensor BMP280
+  if (!bmp.begin(0x76)) {
+    Serial.println("Sensor BMP280 tidak terdeteksi. Cek wiring & address!");
+  }
+
+  // Inisialisasi sensor raindrop (digital)
+  pinMode(RAINDROP_PIN, INPUT);
+
+  // Inisialisasi pin buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Inisialisasi modul GPS
+  gpsSerial.begin(9600);
+
+  // Inisialisasi layar OLED
+  Wire.begin(D2, D1);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Inisialisasi OLED gagal!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  WiFi.mode(WIFI_STA);
+  Serial.print("MAC Address untuk node ini (Transmitter): ");
+  Serial.println(WiFi.macAddress());
+
+  // Inisialisasi komunikasi ESP-NOW
+  if (esp_now_init() != 0) {
+    Serial.println("Inisialisasi ESP-NOW tidak berhasil. Mulai ulang perangkat...");
+    ESP.restart();
+  }
+  Serial.println("ESP-NOW berhasil diinisialisasi.");
+
+  esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+
+   esp_now_register_send_cb(OnDataSent);
+
+   esp_now_add_peer(broadcastAddress, ESP_NOW_ROLE_SLAVE, 1, NULL, 0);
+}
+
+void loop() {
+  // 1.  Ambil data dari DHT22
+  dataToSend.dhtTemperature = dht.readTemperature();
+  dataToSend.dhtHumidity    = dht.readHumidity();
+
+  // 2. Ambil data dari BMP280
+  dataToSend.bmpTemperature = bmp.readTemperature(); 
+  dataToSend.pressure       = bmp.readPressure() / 100.0F; 
+  dataToSend.altitudeBmp    = bmp.readAltitude(1013.25);
+
+  // 3. Ambil data dari GPS
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  if (gps.location.isValid()) {
+    dataToSend.gpsLatitude  = gps.location.lat();
+    dataToSend.gpsLongitude = gps.location.lng();
+  } else {
+    dataToSend.gpsLatitude  = 0.0;
+    dataToSend.gpsLongitude = 0.0;
+  }
+  if (gps.altitude.isValid()) {
+    dataToSend.gpsAltitude = gps.altitude.meters();
+  } else {
+    dataToSend.gpsAltitude = 0.0;
+  }
+  dataToSend.gpsSat = gps.satellites.value();
+
+  // 4. Ambil data sensor hujan
+  dataToSend.rainDigital = digitalRead(RAINDROP_PIN);
+
+  // 5. Ambil data tegangan baterai
+  int adcVal = analogRead(BATTERY_PIN);
+
+  float factor = 4.2 / 1023.0;  
+  dataToSend.batteryVoltage = adcVal * factor;
+
+  // 6. Buzzer/LED indikator baterai lemah
+  float lowThreshold = 3.5;  // Contoh ambang
+  if (dataToSend.batteryVoltage < lowThreshold) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // 7. Output ke OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("=== Data Sensor ===");
+  display.print("DHT Temp : "); display.println(dataToSend.dhtTemperature, 1);
+  display.print("DHT Humid: "); display.println(dataToSend.dhtHumidity, 1);
+  display.print("BMP Temp : "); display.println(dataToSend.bmpTemperature, 1);
+  display.print("Press(hPa): "); display.println(dataToSend.pressure, 1);
+  display.print("Alt BMP(m): "); display.println(dataToSend.altitudeBmp, 1);
+  display.print("GPS Lat  : "); display.println(dataToSend.gpsLatitude, 6);
+  display.print("GPS Lon  : "); display.println(dataToSend.gpsLongitude, 6);
+  display.print("GPS Alt(m): "); display.println(dataToSend.gpsAltitude, 1);
+  display.print("Sat      : "); display.println(dataToSend.gpsSat);
+  display.print("Rain Dig : "); display.println(dataToSend.rainDigital);
+  display.print("Batt (V) : "); display.println(dataToSend.batteryVoltage, 2);
+  display.display();
+
+  esp_now_send(broadcastAddress, (uint8_t *) &dataToSend, sizeof(dataToSend));
+
+  delay(2000);
+}
+
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+
+typedef struct struct_message {
+  float dhtTemperature;
+  float dhtHumidity;
+  float bmpTemperature;
+  float pressure;
+  float altitudeBmp;
+  float gpsLatitude;
+  float gpsLongitude;
+  float gpsAltitude;
+  uint8_t gpsSat;
+  float batteryVoltage;
+  int rainDigital;
+} struct_message;
+
+struct_message incomingData;
+
+// Callback untuk penerimaan data
+void OnDataRecv(uint8_t *mac, uint8_t *incoming, uint8_t len) {
+  memcpy(&incomingData, incoming, sizeof(incomingData));
+
+  Serial.print("Penerimaan data berhasil (");
+  Serial.print(len);
+  Serial.println(" bytes):");
+
+  Serial.println("=== SENSOR DATA ===");
+  Serial.print("DHT Temp    : "); Serial.println(incomingData.dhtTemperature, 1);
+  Serial.print("DHT Humid   : "); Serial.println(incomingData.dhtHumidity, 1);
+  Serial.print("BMP Temp    : "); Serial.println(incomingData.bmpTemperature, 1);
+  Serial.print("Pressure(hPa): "); Serial.println(incomingData.pressure, 1);
+  Serial.print("Alt BMP (m) : "); Serial.println(incomingData.altitudeBmp, 1);
+  Serial.print("GPS Lat     : "); Serial.println(incomingData.gpsLatitude, 6);
+  Serial.print("GPS Lon     : "); Serial.println(incomingData.gpsLongitude, 6);
+  Serial.print("GPS Alt (m) : "); Serial.println(incomingData.gpsAltitude, 1);
+  Serial.print("GPS Sat     : "); Serial.println(incomingData.gpsSat);
+  Serial.print("Rain Digital: "); Serial.println(incomingData.rainDigital);
+  Serial.print("Batt (V)    : "); Serial.println(incomingData.batteryVoltage, 2);
+  Serial.println("====================\n");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inisialisasi WiFi Station mode
+  WiFi.mode(WIFI_STA);
+  Serial.println("Node Penerima ESP-NOW");
+
+  // Tampilkan alamat MAC perangkat
+  Serial.print("MAC Address perangkat ini (Penerima): ");
+  Serial.println(WiFi.macAddress());
+
+  // ESP-NOW initialization
+  if (esp_now_init() != 0) {
+    Serial.println("Kesalahan inisialisasi ESP-NOW. Coba restart...");
+    ESP.restart();
+  }
+  Serial.println("ESP-NOW init berhasil.");
+
+  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+
+  esp_now_register_recv_cb(OnDataRecv);
+}
+
+void loop() {
+
+}
